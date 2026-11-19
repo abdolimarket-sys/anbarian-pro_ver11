@@ -1,0 +1,144 @@
+name: Build Anbarin APK
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build Android APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # --- مرحله جدید: باز کردن فایل ZIP در صورت وجود ---
+      - name: Unzip project if ZIP exists
+        run: |
+          # جستجوی هر فایل .zip در ریشه مخزن
+          ZIP_FILE=$(find . -maxdepth 1 -name "*.zip" -print -quit)
+          if [ -n "$ZIP_FILE" ]; then
+            echo "Found ZIP: $ZIP_FILE — extracting..."
+            unzip -o "$ZIP_FILE" -d .
+            echo "ZIP extracted successfully."
+            # حذف فایل ZIP برای جلوگیری از اختلال در مراحل بعدی
+            rm -f "$ZIP_FILE"
+          else
+            echo "No ZIP file found. Assuming project files are already in the repository."
+          fi
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: "platform-tools platforms;android-34 build-tools;34.0.0"
+
+      - name: Accept Android licenses
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager --update || true
+
+      - name: Install npm dependencies
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci --registry https://registry.npmjs.org/
+          else
+            npm install --registry https://registry.npmjs.org/
+          fi
+
+      - name: TypeScript syntax and type check
+        run: npm run typecheck
+
+      - name: Run regression tests
+        run: npm test
+
+      - name: Typecheck and build web
+        run: npm run build
+
+      - name: Verify Android Gradle project scaffold
+        run: |
+          test -f android/settings.gradle || { echo 'Missing android/settings.gradle; Android platform scaffold is incomplete.'; exit 1; }
+          test -f android/build.gradle || { echo 'Missing android/build.gradle; Android platform scaffold is incomplete.'; exit 1; }
+          test -f android/app/build.gradle || { echo 'Missing android/app/build.gradle; Android platform scaffold is incomplete.'; exit 1; }
+
+      - name: Synchronize Android release version
+        run: npm run android:version
+
+      - name: Sync Capacitor Android
+        run: npx cap sync android
+
+      # --- امضای Release (اختیاری؛ با GitHub Secrets) ---
+      - name: Prepare release keystore
+        id: signing
+        env:
+          ANBARIN_KEYSTORE_BASE64: ${{ secrets.ANBARIN_KEYSTORE_BASE64 }}
+          ANBARIN_KEYSTORE_PASSWORD: ${{ secrets.ANBARIN_KEYSTORE_PASSWORD }}
+          ANBARIN_KEY_ALIAS: ${{ secrets.ANBARIN_KEY_ALIAS }}
+          ANBARIN_KEY_PASSWORD: ${{ secrets.ANBARIN_KEY_PASSWORD }}
+        run: |
+          if [ -n "$ANBARIN_KEYSTORE_BASE64" ] && [ -n "$ANBARIN_KEYSTORE_PASSWORD" ] \
+            && [ -n "$ANBARIN_KEY_ALIAS" ] && [ -n "$ANBARIN_KEY_PASSWORD" ]; then
+            echo "$ANBARIN_KEYSTORE_BASE64" | base64 -d > "$GITHUB_WORKSPACE/anbarin-release.keystore"
+            echo "has_signing=true" >> "$GITHUB_OUTPUT"
+            echo "Release signing secrets detected."
+          else
+            echo "has_signing=false" >> "$GITHUB_OUTPUT"
+            echo "Release secrets missing — will build debug APK only."
+          fi
+
+      - name: Build release APK (signed)
+        if: steps.signing.outputs.has_signing == 'true'
+        working-directory: android
+        env:
+          ANBARIN_KEYSTORE_PATH: ${{ github.workspace }}/anbarin-release.keystore
+          ANBARIN_KEYSTORE_PASSWORD: ${{ secrets.ANBARIN_KEYSTORE_PASSWORD }}
+          ANBARIN_KEY_ALIAS: ${{ secrets.ANBARIN_KEY_ALIAS }}
+          ANBARIN_KEY_PASSWORD: ${{ secrets.ANBARIN_KEY_PASSWORD }}
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon --stacktrace
+          ls -la app/build/outputs/apk/release/ || true
+
+      - name: Build debug APK (fallback / PR)
+        if: steps.signing.outputs.has_signing != 'true'
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - name: Upload release APK
+        if: steps.signing.outputs.has_signing == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: anbarin-release-apk
+          path: android/app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload debug APK
+        if: steps.signing.outputs.has_signing != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: anbarin-debug-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Wipe keystore from runner
+        if: always() && steps.signing.outputs.has_signing == 'true'
+        run: rm -f "$GITHUB_WORKSPACE/anbarin-release.keystore"
